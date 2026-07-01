@@ -427,10 +427,6 @@ class SessionResponse(BaseModel):
     error: Optional[str] = None
     sessionid: Optional[str] = None
 
-class HealthResponse(BaseModel):
-    status: str = "ok"
-    sessions_active: int = 0
-    browser_ready: bool = True
 
 
 # ============================================================
@@ -452,12 +448,9 @@ app = FastAPI(
 # ============================================================
 # Endpoints
 # ============================================================
-@app.get("/health", response_model=HealthResponse)
+@app.get("/health")
 async def health():
-    return HealthResponse(
-        sessions_active=len(session_manager.sessions),
-        browser_ready=session_manager.browser is not None
-    )
+    return {"status": "ok"}
 
 @app.post("/auth/login", response_model=SessionResponse)
 async def login(
