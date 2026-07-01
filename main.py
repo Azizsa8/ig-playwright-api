@@ -14,7 +14,9 @@ from fastapi import FastAPI, HTTPException, Form, Body, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
-from loguru import logger
+import logging
+logger = logging.getLogger("ig-api")
+logging.basicConfig(level=logging.INFO)
 
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
