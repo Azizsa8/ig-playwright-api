@@ -4,9 +4,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libdbus-1-3 libxkbcommon0 libatspi2.0-0 libxcomposite1 libxdamage1 \
     libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libasound2 \
     fonts-liberation wget ca-certificates && rm -rf /var/lib/apt/lists/*
-RUN playwright install chromium --with-deps
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+RUN playwright install chromium --with-deps
 COPY main.py .
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

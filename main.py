@@ -57,24 +57,25 @@ class SessionManager:
     
     def __init__(self):
         self.sessions: Dict[str, Dict] = {}
-        self.browser: Optional[Browser] = None
         self.playwright = None
         os.makedirs(settings.SESSION_DIR, exist_ok=True)
     
     async def startup(self):
         self.playwright = await async_playwright().start()
-        self.browser = await self.playwright.chromium.launch(
-            headless=settings.BROWSER_HEADLESS,
-            args=settings.BROWSER_ARGS
-        )
-        logger.info("Playwright browser started")
+        logger.info("Playwright started")
     
     async def shutdown(self):
-        if self.browser:
-            await self.browser.close()
+        # Close all contexts
+        for sid, sess in list(self.sessions.items()):
+            try:
+                if sess.get("context"):
+                    await sess["context"].close()
+            except Exception:
+                pass
+        self.sessions.clear()
         if self.playwright:
             await self.playwright.stop()
-        logger.info("Playwright browser stopped")
+        logger.info("Playwright stopped")
     
     def _session_path(self, session_id: str) -> str:
         return os.path.join(settings.SESSION_DIR, session_id)
@@ -82,8 +83,10 @@ class SessionManager:
     async def create_session(self, session_id: Optional[str] = None) -> str:
         """Create a new persistent browser context."""
         sid = session_id or str(uuid.uuid4())
-        context = await self.browser.new_context(
+        context = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=self._session_path(sid),
+            headless=settings.BROWSER_HEADLESS,
+            args=settings.BROWSER_ARGS,
             viewport={"width": 1280, "height": 720},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -114,8 +117,10 @@ class SessionManager:
     
     async def restore_session(self, session_id: str) -> Dict:
         """Restore a session from persistent storage."""
-        context = await self.browser.new_context(
+        context = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=self._session_path(session_id),
+            headless=settings.BROWSER_HEADLESS,
+            args=settings.BROWSER_ARGS,
             viewport={"width": 1280, "height": 720},
         )
         self.sessions[session_id] = {
@@ -187,12 +192,12 @@ class InstagramClient:
         await self.navigate(settings.IG_LOGIN_URL)
         
         # Fill login form
-        await self.page.fill('input[name="username"]', username)
-        await self.page.fill('input[name="password"]', password)
+        await self.page.fill('input[name="email"]', username)
+        await self.page.fill('input[name="pass"]', password)
         await self._random_delay()
         
         # Click login
-        await self.page.click('button[type="submit"]')
+        await self.page.click('div[role="button"]:has-text("Log in")')
         await self.page.wait_for_load_state("networkidle", timeout=30000)
         
         # Check for challenges
@@ -294,7 +299,7 @@ class InstagramClient:
             
             # Submit
             submit_btn = await self.page.wait_for_selector(
-                'button[type="submit"], button:has-text("Confirm"), button:has-text("Submit")',
+                'div[role="button"]:has-text("Confirm"), div[role="button"]:has-text("Submit"), div[role="button"]:has-text("Send"), button[type="submit"]',
                 timeout=5000
             )
             await submit_btn.click()
