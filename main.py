@@ -1,71 +1,135 @@
 """
-Instagram API service using Playwright browser automation.
-Replaces aiograpi-rest with a working, maintainable implementation.
+Multi-platform Social Media API using Playwright browser automation.
+Supports Instagram (login, challenge bypass, sessionid, post, media)
+and LinkedIn (login, sessionid, post text, post image).
 """
 import os
 import json
 import asyncio
 import uuid
-from datetime import datetime, timedelta
+import re
+import tempfile
+from datetime import datetime
 from typing import Optional, Dict, Any, List
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Form, Body, BackgroundTasks
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+import httpx
+from fastapi import FastAPI, HTTPException, Form, UploadFile, File
+from pydantic import BaseModel
 from pydantic_settings import BaseSettings
 import logging
-logger = logging.getLogger("ig-api")
+logger = logging.getLogger("social-api")
 logging.basicConfig(level=logging.INFO)
 
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+from playwright.async_api import async_playwright, Page
+
 
 # ============================================================
 # Configuration
 # ============================================================
 class Settings(BaseSettings):
-    # Service
     PORT: int = 8000
     HOST: str = "0.0.0.0"
-    
-    # Playwright
     BROWSER_HEADLESS: bool = True
-    BROWSER_ARGS: list = ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
-    
-    # Session storage
+    BROWSER_ARGS: list = ["--no-sandbox", "--disable-setuid-sandbox",
+                          "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"]
     SESSION_DIR: str = "/app/sessions"
     SESSION_TTL_HOURS: int = 24
-    
-    # Instagram
     IG_LOGIN_URL: str = "https://www.instagram.com/accounts/login/"
     IG_BASE_URL: str = "https://www.instagram.com"
-    
-    # Rate limiting
+    LI_LOGIN_URL: str = "https://www.linkedin.com/login"
+    LI_BASE_URL: str = "https://www.linkedin.com"
     REQUEST_DELAY_MS: int = 2000
-    
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
 
 settings = Settings()
 
+
+# ============================================================
+# Stealth Injection Script
+# ============================================================
+STEALTH_SCRIPT = """
+// Override webdriver flag
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+// Chrome runtime mock
+window.chrome = { runtime: {} };
+
+// Block notification permission query
+const _origQuery = window.navigator.permissions.query;
+window.navigator.permissions.query = (params) =>
+    params.name === 'notifications'
+        ? Promise.resolve({ state: 'denied' })
+        : _origQuery(params);
+
+// Plugins array
+Object.defineProperty(navigator, 'plugins', {
+    get: () => [1, 2, 3, 4, 5],
+});
+
+// Languages
+Object.defineProperty(navigator, 'languages', {
+    get: () => ['en-US', 'en'],
+});
+
+// Canvas noise (~0.5% of pixels)
+const _toDataURL = HTMLCanvasElement.prototype.toDataURL;
+HTMLCanvasElement.prototype.toDataURL = function (type) {
+    const ctx = this.getContext('2d');
+    if (ctx) {
+        const img = ctx.getImageData(0, 0, this.width, this.height);
+        for (let i = 0; i < img.data.length; i += 4) {
+            if (Math.random() < 0.005) {
+                img.data[i] ^= 1;
+            }
+        }
+        ctx.putImageData(img, 0, 0);
+    }
+    return _toDataURL.apply(this, arguments);
+};
+"""
+
+
+async def apply_stealth(page: Page):
+    await page.add_init_script(STEALTH_SCRIPT)
+
+
+# ============================================================
+# Common helpers
+# ============================================================
+async def random_delay(ms: int = 0):
+    delay = ms or settings.REQUEST_DELAY_MS
+    await asyncio.sleep(delay / 1000)
+
+
+async def download_image(url: str) -> str:
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(url, timeout=30.0)
+        resp.raise_for_status()
+        f = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+        f.write(resp.content)
+        tmp = f.name
+        f.close()
+        return tmp
+
+
 # ============================================================
 # Session Management
 # ============================================================
 class SessionManager:
-    """Manages persistent browser contexts per session."""
-    
     def __init__(self):
         self.sessions: Dict[str, Dict] = {}
         self.playwright = None
         os.makedirs(settings.SESSION_DIR, exist_ok=True)
-    
+
     async def startup(self):
         self.playwright = await async_playwright().start()
         logger.info("Playwright started")
-    
+
     async def shutdown(self):
-        # Close all contexts
         for sid, sess in list(self.sessions.items()):
             try:
                 if sess.get("context"):
@@ -76,12 +140,11 @@ class SessionManager:
         if self.playwright:
             await self.playwright.stop()
         logger.info("Playwright stopped")
-    
-    def _session_path(self, session_id: str) -> str:
-        return os.path.join(settings.SESSION_DIR, session_id)
-    
+
+    def _session_path(self, sid: str) -> str:
+        return os.path.join(settings.SESSION_DIR, sid)
+
     async def create_session(self, session_id: Optional[str] = None) -> str:
-        """Create a new persistent browser context."""
         sid = session_id or str(uuid.uuid4())
         context = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=self._session_path(sid),
@@ -96,344 +159,495 @@ class SessionManager:
             locale="en-US",
             timezone_id="America/New_York",
         )
-        
         self.sessions[sid] = {
             "context": context,
             "created_at": datetime.utcnow(),
             "page": None,
-            "logged_in": False,
-            "username": None,
+            "ig": {"logged_in": False, "username": None},
+            "li": {"logged_in": False, "username": None},
         }
         logger.info(f"Created session: {sid}")
         return sid
-    
+
     async def get_session(self, session_id: str) -> Dict:
         if session_id not in self.sessions:
-            # Try to restore from disk
-            await self.restore_session(session_id)
+            await self._restore_session(session_id)
         if session_id not in self.sessions:
             raise HTTPException(404, f"Session not found: {session_id}")
         return self.sessions[session_id]
-    
-    async def restore_session(self, session_id: str) -> Dict:
-        """Restore a session from persistent storage."""
-        context = await self.playwright.chromium.launch_persistent_context(
+
+    async def _restore_session(self, session_id: str) -> Dict:
+        ctx = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=self._session_path(session_id),
             headless=settings.BROWSER_HEADLESS,
             args=settings.BROWSER_ARGS,
             viewport={"width": 1280, "height": 720},
         )
         self.sessions[session_id] = {
-            "context": context,
+            "context": ctx,
             "created_at": datetime.utcnow(),
             "page": None,
-            "logged_in": None,  # Unknown until checked
-            "username": None,
+            "ig": {"logged_in": None, "username": None},
+            "li": {"logged_in": None, "username": None},
         }
         logger.info(f"Restored session: {session_id}")
         return self.sessions[session_id]
-    
+
     async def get_page(self, session_id: str) -> Page:
-        session = await self.get_session(session_id)
-        if session["page"] is None or session["page"].is_closed():
-            session["page"] = await session["context"].new_page()
-        return session["page"]
-    
+        sess = await self.get_session(session_id)
+        if sess["page"] is None or sess["page"].is_closed():
+            sess["page"] = await sess["context"].new_page()
+        return sess["page"]
+
     async def close_session(self, session_id: str):
         if session_id in self.sessions:
-            ctx = self.sessions[session_id]["context"]
-            await ctx.close()
+            await self.sessions[session_id]["context"].close()
             del self.sessions[session_id]
             logger.info(f"Closed session: {session_id}")
-    
+
     async def cleanup_expired(self):
         now = datetime.utcnow()
-        expired = [
-            sid for sid, s in self.sessions.items()
-            if (now - s["created_at"]).total_seconds() > settings.SESSION_TTL_HOURS * 3600
-        ]
+        expired = [sid for sid, s in self.sessions.items()
+                   if (now - s["created_at"]).total_seconds() > settings.SESSION_TTL_HOURS * 3600]
         for sid in expired:
             await self.close_session(sid)
 
+
 session_manager = SessionManager()
 
+
 # ============================================================
-# Instagram Interaction Helpers
+# Instagram Client
 # ============================================================
 class InstagramClient:
-    """High-level Instagram interactions via Playwright."""
-    
     def __init__(self, page: Page):
         self.page = page
-    
-    async def navigate(self, url: str, wait_until: str = "networkidle"):
-        await self.page.goto(url, wait_until=wait_until, timeout=60000)
-        await self._random_delay()
-    
-    async def _random_delay(self):
-        await asyncio.sleep(settings.REQUEST_DELAY_MS / 1000)
-    
+
+    async def goto(self, url: str):
+        await self.page.goto(url, wait_until="networkidle", timeout=60000)
+        await random_delay()
+
     async def is_logged_in(self) -> bool:
-        """Check if currently logged in."""
         try:
-            # Check for login form absence or profile element presence
             await self.page.wait_for_selector(
                 'header [role="button"][aria-label*="Profile"], '
                 'a[href*="/accounts/logout/"], '
                 'svg[aria-label="Home"]',
-                timeout=5000
+                timeout=5000,
             )
             return True
-        except:
+        except Exception:
             return False
-    
+
+    async def login_by_sessionid(self, sessionid: str) -> Dict[str, Any]:
+        """Inject sessionid cookie to restore login without password."""
+        await self.goto("https://www.instagram.com/")
+        await self.page.context.add_cookies([
+            {"name": "sessionid", "value": sessionid, "domain": ".instagram.com", "path": "/"},
+            {"name": "ig_did", "value": str(uuid.uuid4()).replace("-", "")[:16],
+             "domain": ".instagram.com", "path": "/"},
+        ])
+        # Refresh to pick up cookies
+        await self.goto("https://www.instagram.com/")
+        logged_in = await self.is_logged_in()
+        if logged_in:
+            csrftoken = None
+            cookies = await self.page.context.cookies()
+            for c in cookies:
+                if c["name"] == "csrftoken":
+                    csrftoken = c["value"]
+                    break
+            return {"success": True, "sessionid": sessionid, "csrftoken": csrftoken}
+        return {"error": "Sessionid expired or invalid", "success": False}
+
     async def login(self, username: str, password: str) -> Dict[str, Any]:
-        """Perform login with challenge handling."""
-        await self.navigate(settings.IG_LOGIN_URL)
-        
-        # Fill login form
+        await self.goto(settings.IG_LOGIN_URL)
+
         await self.page.fill('input[name="email"]', username)
         await self.page.fill('input[name="pass"]', password)
-        await self._random_delay()
-        
-        # Click login
+        await random_delay()
+
         await self.page.click('div[role="button"]:has-text("Log in")')
         await self.page.wait_for_load_state("networkidle", timeout=30000)
-        
-        # Check for challenges
-        challenge = await self._handle_challenges()
+
+        challenge = await self._detect_challenge()
         if challenge:
-            return {"challenge": True, **challenge}
-        
-        # Check login success
+            bloks = await self._try_bloks_bypass()
+            if bloks:
+                logger.info("Bloks challenge bypass succeeded")
+                await self.page.wait_for_load_state("networkidle", timeout=15000)
+            else:
+                return {"challenge": True, **challenge}
+
         logged_in = await self.is_logged_in()
         if not logged_in:
-            # Check for error messages
             error = await self._get_login_error()
-            return {"error": error or "Login failed"}
-        
-        # Get session info
+            return {"error": error or "Login failed", "success": False}
+
         cookies = await self.page.context.cookies()
         sessionid = next((c["value"] for c in cookies if c["name"] == "sessionid"), None)
         csrftoken = next((c["value"] for c in cookies if c["name"] == "csrftoken"), None)
-        
-        return {
-            "success": True,
-            "sessionid": sessionid,
-            "csrftoken": csrftoken,
-            "username": username,
-        }
-    
-    async def _handle_challenges(self) -> Optional[Dict]:
-        """Detect and return challenge info if present."""
-        # Check for challenge forms
-        challenge_selectors = [
+        return {"success": True, "sessionid": sessionid, "csrftoken": csrftoken, "username": username}
+
+    async def _detect_challenge(self) -> Optional[Dict]:
+        selectors = [
             'div[role="dialog"]:has-text("Challenge")',
             'div[role="dialog"]:has-text("Verify")',
             'div[role="dialog"]:has-text("Confirm")',
             'form[id*="challenge"]',
         ]
-        
-        for sel in challenge_selectors:
+        for sel in selectors:
             try:
                 el = await self.page.wait_for_selector(sel, timeout=3000)
                 if el:
-                    # Extract challenge details
                     text = await el.inner_text()
-                    return {
-                        "challenge_type": "manual" if "code" in text.lower() else "unknown",
-                        "message": text[:500],
-                        "html": await el.inner_html(),
-                    }
-            except:
+                    html = await el.inner_html()
+                    return {"challenge_type": "manual" if "code" in text.lower() else "unknown",
+                            "message": text[:500], "html": html[:1000]}
+            except Exception:
                 continue
-        
-        # Check for "bad_password" / IP block message
+
+        # Check IP-block messages
         try:
-            error_el = await self.page.wait_for_selector(
-                'div[role="alert"], .x1lliihq, [id*="error"]',
-                timeout=3000
-            )
-            if error_el:
-                text = await error_el.inner_text()
+            el = await self.page.wait_for_selector(
+                'div[role="alert"], .x1lliihq, [id*="error"]', timeout=3000)
+            if el:
+                text = await el.inner_text()
                 if "email" in text.lower() or "block" in text.lower():
-                    return {
-                        "challenge_type": "ip_block",
-                        "message": text[:500],
-                        "requires_new_ip": True,
-                    }
-        except:
+                    return {"challenge_type": "ip_block", "message": text[:500],
+                            "requires_new_ip": True}
+        except Exception:
             pass
-        
         return None
-    
-    async def _get_login_error(self) -> Optional[str]:
+
+    async def _try_bloks_bypass(self) -> bool:
+        """
+        Attempt programmatic Bloks challenge bypass (PR #2652 technique).
+        Extracts challenge_context from the page and POSTs choice:0.
+        """
         try:
-            error_selectors = [
-                'div[role="alert"]',
-                '.x1lliihq',
-                '[id*="error"]',
-                'p:has-text("Sorry")',
-                'p:has-text("incorrect")',
-            ]
-            for sel in error_selectors:
+            # Look for challenge context in page content
+            html = await self.page.content()
+            match = re.search(r'"challenge_context"\s*:\s*"([^"]+)"', html)
+            if not match:
+                match = re.search(r'challengeContext\s*=\s*["\']([^"\']+)["\']', html)
+            context = match.group(1) if match else None
+            if not context:
+                logger.info("No Bloks challenge context found on page")
+                return False
+
+            # Extract csrftoken from cookies or meta
+            csrf = None
+            cookies = await self.page.context.cookies()
+            for c in cookies:
+                if c["name"] == "csrftoken":
+                    csrf = c["value"]
+                    break
+            if not csrf:
+                meta = await self.page.query_selector('meta[name="csrf-token"]')
+                if meta:
+                    csrf = await meta.get_attribute("content")
+            if not csrf:
+                csrf = "missing"
+
+            # POST to Bloks challenge take_challenge endpoint
+            from playwright.async_api import expect
+            url = "https://i.instagram.com/api/v1/bloks/apps/com.instagram.challenge.navigation.take_challenge/"
+            payload = {"challenge_context": context, "choice": "0"}
+
+            resp = await self.page.evaluate(
+                """async (url, payload, csrf) => {
+                    const r = await fetch(url, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                            'X-CSRFToken': csrf,
+                            'X-Requested-With': 'XMLHttpRequest',
+                        },
+                        body: new URLSearchParams(payload).toString(),
+                    });
+                    const text = await r.text();
+                    return { status: r.status, body: text.substring(0, 500) };
+                }""",
+                url, payload, csrf
+            )
+            logger.info(f"Bloks bypass response: {resp}")
+            return resp.get("status") in (200, 201)
+        except Exception as e:
+            logger.warning(f"Bloks bypass failed: {e}")
+            return False
+
+    async def _get_login_error(self) -> Optional[str]:
+        for sel in ['div[role="alert"]', '.x1lliihq', '[id*="error"]',
+                     'p:has-text("Sorry")', 'p:has-text("incorrect")']:
+            try:
                 el = await self.page.wait_for_selector(sel, timeout=2000)
                 if el:
-                    text = await el.inner_text()
-                    if text.strip():
-                        return text.strip()
-        except:
-            pass
+                    text = (await el.inner_text()).strip()
+                    if text:
+                        return text
+            except Exception:
+                pass
         return None
-    
+
     async def resolve_challenge(self, security_code: str) -> Dict:
-        """Submit security code for challenge resolution."""
         try:
-            # Find code input
-            code_input = await self.page.wait_for_selector(
-                'input[name="security_code"], input[name="code"], input[autocomplete="one-time-code"]',
-                timeout=5000
-            )
-            await code_input.fill(security_code)
-            await self._random_delay()
-            
-            # Submit
-            submit_btn = await self.page.wait_for_selector(
-                'div[role="button"]:has-text("Confirm"), div[role="button"]:has-text("Submit"), div[role="button"]:has-text("Send"), button[type="submit"]',
-                timeout=5000
-            )
-            await submit_btn.click()
+            inp = await self.page.wait_for_selector(
+                'input[name="security_code"], input[name="code"], '
+                'input[autocomplete="one-time-code"]', timeout=5000)
+            await inp.fill(security_code)
+            await random_delay()
+            btn = await self.page.wait_for_selector(
+                'div[role="button"]:has-text("Confirm"), '
+                'div[role="button"]:has-text("Submit"), '
+                'button[type="submit"]', timeout=5000)
+            await btn.click()
             await self.page.wait_for_load_state("networkidle", timeout=30000)
-            
-            logged_in = await self.is_logged_in()
-            return {"success": logged_in, "logged_in": logged_in}
+            ok = await self.is_logged_in()
+            return {"success": ok, "logged_in": ok}
         except Exception as e:
             return {"error": str(e), "success": False}
-    
-    async def get_profile_info(self) -> Dict:
-        """Get basic profile info."""
-        await self.navigate(f"{settings.IG_BASE_URL}/")
-        await self._random_delay()
-        
-        # Extract username from header/profile link
-        try:
-            profile_link = await self.page.wait_for_selector(
-                'header a[href^="/"][href$="/"]',
-                timeout=5000
-            )
-            href = await profile_link.get_attribute("href")
-            username = href.strip("/") if href else None
-        except:
-            username = None
-        
-        return {"username": username, "logged_in": await self.is_logged_in()}
-    
+
     async def upload_photo(self, image_path: str, caption: str = "") -> Dict:
-        """Upload a photo post."""
-        await self.navigate(f"{settings.IG_BASE_URL}/")
-        await self._random_delay()
-        
-        # Click create/new post button
-        create_selectors = [
-            'svg[aria-label="New post"]',
-            'a[href="/create/"]',
-            'div[role="button"]:has-text("Create")',
-        ]
-        for sel in create_selectors:
+        await self.goto(settings.IG_BASE_URL + "/")
+        for sel in ['svg[aria-label="New post"]', 'a[href="/create/"]',
+                     'div[role="button"]:has-text("Create")']:
             try:
                 await self.page.click(sel, timeout=3000)
                 break
-            except:
+            except Exception:
                 continue
-        
         await self.page.wait_for_selector('input[type="file"]', timeout=10000)
-        file_input = await self.page.query_selector('input[type="file"]')
-        await file_input.set_input_files(image_path)
-        
+        await (await self.page.query_selector('input[type="file"]')).set_input_files(image_path)
         await self.page.wait_for_load_state("networkidle", timeout=30000)
-        
-        # Next buttons
         for _ in range(2):
-            next_btn = await self.page.wait_for_selector(
-                'button:has-text("Next"), div[role="button"]:has-text("Next")',
-                timeout=10000
-            )
-            await next_btn.click()
-            await self._random_delay()
-        
-        # Caption
+            btn = await self.page.wait_for_selector(
+                'button:has-text("Next"), div[role="button"]:has-text("Next")', timeout=10000)
+            await btn.click()
+            await random_delay()
         if caption:
-            caption_area = await self.page.wait_for_selector(
-                'textarea[aria-label="Write a caption..."], textarea[placeholder*="caption"]',
-                timeout=5000
-            )
-            await caption_area.fill(caption)
-            await self._random_delay()
-        
-        # Share
-        share_btn = await self.page.wait_for_selector(
-            'button:has-text("Share"), div[role="button"]:has-text("Share")',
-            timeout=10000
-        )
-        await share_btn.click()
+            ta = await self.page.wait_for_selector(
+                'textarea[aria-label="Write a caption..."], '
+                'textarea[placeholder*="caption"]', timeout=5000)
+            await ta.fill(caption)
+            await random_delay()
+        share = await self.page.wait_for_selector(
+            'button:has-text("Share"), div[role="button"]:has-text("Share")', timeout=10000)
+        await share.click()
         await self.page.wait_for_load_state("networkidle", timeout=30000)
-        
         return {"success": True}
-    
+
+    async def get_profile_info(self) -> Dict:
+        await self.goto(settings.IG_BASE_URL + "/")
+        try:
+            link = await self.page.wait_for_selector('header a[href^="/"][href$="/"]', timeout=5000)
+            href = await link.get_attribute("href")
+            username = href.strip("/") if href else None
+        except Exception:
+            username = None
+        return {"username": username, "logged_in": await self.is_logged_in()}
+
     async def get_media(self, username: str, amount: int = 12) -> List[Dict]:
-        """Get recent media for a user."""
-        await self.navigate(f"{settings.IG_BASE_URL}/{username}/")
-        await self._random_delay()
-        
-        # Scroll to load more
-        media_items = []
+        await self.goto(f"{settings.IG_BASE_URL}/{username}/")
+        items = []
         for _ in range(3):
             posts = await self.page.query_selector_all('article a[href*="/p/"]')
-            for post in posts:
-                href = await post.get_attribute("href")
-                if href and href not in [m.get("url") for m in media_items]:
-                    media_items.append({"url": f"{settings.IG_BASE_URL}{href}"})
-            if len(media_items) >= amount:
+            for p in posts:
+                href = await p.get_attribute("href")
+                if href and href not in [m.get("url") for m in items]:
+                    items.append({"url": f"{settings.IG_BASE_URL}{href}"})
+            if len(items) >= amount:
                 break
             await self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await asyncio.sleep(2)
-        
-        return media_items[:amount]
-    
-    async def get_insights(self) -> Dict:
-        """Get account insights (requires professional account)."""
-        await self.navigate(f"{settings.IG_BASE_URL}/accounts/insights/")
-        await self._random_delay()
-        
-        # Extract basic insights if available
-        return {"available": await self.is_logged_in()}
+        return items[:amount]
 
 
 # ============================================================
-# FastAPI Models
+# LinkedIn Client
 # ============================================================
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-    session_id: Optional[str] = None
+class LinkedInClient:
+    def __init__(self, page: Page):
+        self.page = page
 
-class ChallengeResolveRequest(BaseModel):
-    session_id: str
-    security_code: str
+    async def goto(self, url: str):
+        await self.page.goto(url, wait_until="networkidle", timeout=60000)
+        await random_delay()
 
-class PhotoUploadRequest(BaseModel):
-    session_id: str
-    image_url: str  # We'll download it first
-    caption: str = ""
+    async def is_logged_in(self) -> bool:
+        try:
+            await self.page.wait_for_selector(
+                '#feed-nav, .feed-identity-module, '
+                'a[href*="/feed/"], .global-nav__me', timeout=5000)
+            return True
+        except Exception:
+            return False
 
+    async def login_by_sessionid(self, li_at: str) -> Dict[str, Any]:
+        """Inject li_at cookie to restore LinkedIn session."""
+        await self.goto(settings.LI_BASE_URL + "/")
+        await self.page.context.add_cookies([
+            {"name": "li_at", "value": li_at, "domain": ".linkedin.com", "path": "/"},
+            {"name": "lang", "value": "v=2&lang=en-us", "domain": ".linkedin.com", "path": "/"},
+        ])
+        await self.goto(settings.LI_BASE_URL + "/feed/")
+        logged_in = await self.is_logged_in()
+        if logged_in:
+            return {"success": True}
+        return {"error": "li_at cookie expired or invalid", "success": False}
+
+    async def login(self, email: str, password: str) -> Dict[str, Any]:
+        await self.goto(settings.LI_LOGIN_URL)
+        await self.page.fill('input[name="session_key"]', email)
+        await self.page.fill('input[name="session_password"]', password)
+        await random_delay()
+        await self.page.click('button[type="submit"]')
+        await self.page.wait_for_load_state("networkidle", timeout=30000)
+
+        # Check for challenge
+        try:
+            pin = await self.page.wait_for_selector(
+                'input[name="pin"], input[autocomplete="one-time-code"]', timeout=3000)
+            if pin:
+                return {"challenge": True, "challenge_type": "2fa",
+                        "message": "PIN verification required"}
+        except Exception:
+            pass
+
+        logged_in = await self.is_logged_in()
+        if not logged_in:
+            error = await self._get_login_error()
+            return {"error": error or "Login failed", "success": False}
+
+        cookies = await self.page.context.cookies()
+        li_at = next((c["value"] for c in cookies if c["name"] == "li_at"), None)
+        return {"success": True, "li_at": li_at}
+
+    async def _get_login_error(self) -> Optional[str]:
+        for sel in ['#error-for-password', '.form__error', '[role="alert"]']:
+            try:
+                el = await self.page.wait_for_selector(sel, timeout=2000)
+                if el:
+                    text = (await el.inner_text()).strip()
+                    if text:
+                        return text
+            except Exception:
+                pass
+        return None
+
+    async def resolve_2fa(self, pin: str) -> Dict:
+        try:
+            inp = await self.page.wait_for_selector(
+                'input[name="pin"], input[autocomplete="one-time-code"]', timeout=10000)
+            await inp.fill(pin)
+            await random_delay()
+            btn = await self.page.wait_for_selector(
+                'button[type="submit"]:has-text("Submit"), '
+                'button[type="submit"]:has-text("Verify")', timeout=5000)
+            await btn.click()
+            await self.page.wait_for_load_state("networkidle", timeout=30000)
+            ok = await self.is_logged_in()
+            if ok:
+                cookies = await self.page.context.cookies()
+                li_at = next((c["value"] for c in cookies if c["name"] == "li_at"), None)
+                return {"success": True, "logged_in": True, "li_at": li_at}
+            return {"error": "2FA verification failed", "success": False}
+        except Exception as e:
+            return {"error": str(e), "success": False}
+
+    async def post_text(self, text: str) -> Dict:
+        """Post a text update to LinkedIn feed."""
+        await self.goto(settings.LI_BASE_URL + "/feed/")
+        try:
+            # Click "Start a post" / share box
+            share_box = await self.page.wait_for_selector(
+                'div[role="button"]:has-text("Start a post"), '
+                '.share-box__open, div[data-control-name="create_post"]', timeout=10000)
+            await share_box.click()
+            await random_delay(1000)
+
+            # Wait for the editor and type text
+            editor = await self.page.wait_for_selector(
+                'div[role="textbox"][aria-label*="What do you want"], '
+                'div[role="textbox"][contenteditable="true"]', timeout=10000)
+            await editor.fill(text)
+            await random_delay()
+
+            # Click Post
+            post_btn = await self.page.wait_for_selector(
+                'button[type="submit"]:has-text("Post"), '
+                'button:has-text("Post")', timeout=5000)
+            await post_btn.click()
+            await self.page.wait_for_load_state("networkidle", timeout=15000)
+            return {"success": True}
+        except Exception as e:
+            return {"error": str(e), "success": False}
+
+    async def post_image(self, image_path: str, text: str = "") -> Dict:
+        """Post an image to LinkedIn feed."""
+        await self.goto(settings.LI_BASE_URL + "/feed/")
+        try:
+            share_box = await self.page.wait_for_selector(
+                'div[role="button"]:has-text("Start a post"), '
+                '.share-box__open, div[data-control-name="create_post"]', timeout=10000)
+            await share_box.click()
+            await random_delay(1000)
+
+            # Click image icon
+            img_btn = await self.page.wait_for_selector(
+                'button[aria-label*="image"], button[aria-label*="photo"], '
+                'button[aria-label*="media"], li[data-control-name="media_upload"] button',
+                timeout=10000)
+            await img_btn.click()
+            await random_delay()
+
+            # Upload file
+            file_input = await self.page.wait_for_selector(
+                'input[type="file"][accept*="image"]', timeout=10000)
+            await file_input.set_input_files(image_path)
+            await self.page.wait_for_load_state("networkidle", timeout=30000)
+
+            # Add text if provided
+            if text:
+                editor = await self.page.wait_for_selector(
+                    'div[role="textbox"][aria-label*="What do you want"], '
+                    'div[role="textbox"][contenteditable="true"]', timeout=10000)
+                await editor.fill(text)
+                await random_delay()
+
+            # Post
+            post_btn = await self.page.wait_for_selector(
+                'button[type="submit"]:has-text("Post"), '
+                'button:has-text("Post")', timeout=5000)
+            await post_btn.click()
+            await self.page.wait_for_load_state("networkidle", timeout=30000)
+            return {"success": True}
+        except Exception as e:
+            return {"error": str(e), "success": False}
+
+    async def get_profile_info(self) -> Dict:
+        await self.goto(settings.LI_BASE_URL + "/feed/")
+        try:
+            me = await self.page.wait_for_selector(
+                '.global-nav__me, a[href*="/in/"]', timeout=5000)
+            text = await me.inner_text()
+            return {"username": text.strip()[:100], "logged_in": await self.is_logged_in()}
+        except Exception:
+            return {"username": None, "logged_in": await self.is_logged_in()}
+
+
+# ============================================================
+# Pydantic Models
+# ============================================================
 class SessionResponse(BaseModel):
     session_id: str
+    platform: str = "instagram"
     logged_in: bool = False
     username: Optional[str] = None
     challenge: Optional[Dict] = None
     error: Optional[str] = None
     sessionid: Optional[str] = None
-
+    li_at: Optional[str] = None
 
 
 # ============================================================
@@ -446,246 +660,406 @@ async def lifespan(app: FastAPI):
     await session_manager.shutdown()
 
 app = FastAPI(
-    title="Instagram Playwright API",
-    description="Drop-in replacement for aiograpi-rest using Playwright browser automation",
-    version="1.0.0",
+    title="Social Media Playwright API",
+    description="Playwright-based automation for Instagram and LinkedIn.",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
+
 # ============================================================
-# Endpoints
+# Common Endpoints
 # ============================================================
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
-@app.post("/auth/login", response_model=SessionResponse)
-async def login(
-    username: str = Form(...),
-    password: str = Form(...),
-    session_id: Optional[str] = Form(None),
-):
-    """Login to Instagram. Creates session if needed."""
-    try:
-        # Create or restore session
-        if session_id:
-            session = await session_manager.get_session(session_id)
-        else:
-            session_id = await session_manager.create_session()
-            session = session_manager.sessions[session_id]
-        
-        page = await session_manager.get_page(session_id)
-        ig = InstagramClient(page)
-        
-        result = await ig.login(username, password)
-        
-        if result.get("challenge"):
-            session["challenge_data"] = result
-            return SessionResponse(
-                session_id=session_id,
-                challenge=result,
-                logged_in=False,
-            )
-        
-        if result.get("success"):
-            session["logged_in"] = True
-            session["username"] = username
-            return SessionResponse(
-                session_id=session_id,
-                logged_in=True,
-                username=username,
-                sessionid=result.get("sessionid"),
-            )
-        
-        return SessionResponse(
-            session_id=session_id,
-            logged_in=False,
-            error=result.get("error", "Login failed"),
-        )
-        
-    except Exception as e:
-        logger.exception("Login error")
-        raise HTTPException(500, str(e))
-
-@app.post("/auth/challenge/resolve", response_model=SessionResponse)
-async def challenge_resolve(data: ChallengeResolveRequest):
-    """Resolve a login challenge with security code."""
-    try:
-        session = await session_manager.get_session(data.session_id)
-        page = await session_manager.get_page(data.session_id)
-        ig = InstagramClient(page)
-        
-        result = await ig.resolve_challenge(data.security_code)
-        
-        if result.get("success") and result.get("logged_in"):
-            session["logged_in"] = True
-            session["challenge_data"] = None
-            return SessionResponse(
-                session_id=data.session_id,
-                logged_in=True,
-                username=session.get("username"),
-            )
-        
-        return SessionResponse(
-            session_id=data.session_id,
-            logged_in=False,
-            error=result.get("error", "Challenge resolution failed"),
-        )
-    except Exception as e:
-        logger.exception("Challenge resolve error")
-        raise HTTPException(500, str(e))
-
-@app.get("/auth/settings")
-async def auth_settings(session_id: str):
-    """Check auth status / get session info."""
-    try:
-        session = await session_manager.get_session(session_id)
-        page = await session_manager.get_page(session_id)
-        ig = InstagramClient(page)
-        
-        profile = await ig.get_profile_info()
-        return {
-            "logged_in": profile["logged_in"],
-            "username": profile.get("username") or session.get("username"),
-            "session_id": session_id,
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Auth settings error")
-        raise HTTPException(500, str(e))
-
-@app.post("/photo/upload")
-async def photo_upload(
-    session_id: str = Form(...),
-    caption: str = Form(""),
-    image_url: str = Form(...),  # We'll download the image
-):
-    """Upload a photo post."""
-    try:
-        session = await session_manager.get_session(session_id)
-        if not session.get("logged_in"):
-            raise HTTPException(401, "Not logged in")
-        
-        page = await session_manager.get_page(session_id)
-        ig = InstagramClient(page)
-        
-        # Download image to temp file
-        import tempfile
-        import httpx
-        
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(image_url, timeout=30.0)
-            resp.raise_for_status()
-            
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as f:
-                f.write(resp.content)
-                temp_path = f.name
-        
-        try:
-            result = await ig.upload_photo(temp_path, caption)
-            return result
-        finally:
-            try:
-                os.unlink(temp_path)
-            except:
-                pass
-                
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Photo upload error")
-        raise HTTPException(500, str(e))
-
-@app.get("/user/posts")
-async def user_posts(
-    session_id: str,
-    username: Optional[str] = None,
-    amount: int = 12,
-):
-    """Get recent posts for a user."""
-    try:
-        session = await session_manager.get_session(session_id)
-        if not session.get("logged_in"):
-            raise HTTPException(401, "Not logged in")
-        
-        page = await session_manager.get_page(session_id)
-        ig = InstagramClient(page)
-        
-        target = username or session.get("username")
-        if not target:
-            raise HTTPException(400, "Username required")
-        
-        media = await ig.get_media(target, amount)
-        return {"items": media}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("User posts error")
-        raise HTTPException(500, str(e))
-
-@app.get("/account/info")
-async def account_info(session_id: str):
-    """Get account info."""
-    try:
-        session = await session_manager.get_session(session_id)
-        if not session.get("logged_in"):
-            raise HTTPException(401, "Not logged in")
-        
-        page = await session_manager.get_page(session_id)
-        ig = InstagramClient(page)
-        profile = await ig.get_profile_info()
-        
-        return {
-            "username": profile.get("username") or session.get("username"),
-            "logged_in": True,
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Account info error")
-        raise HTTPException(500, str(e))
-
-@app.get("/account/insights")
-async def account_insights(session_id: str):
-    """Get account insights."""
-    try:
-        session = await session_manager.get_session(session_id)
-        if not session.get("logged_in"):
-            raise HTTPException(401, "Not logged in")
-        
-        page = await session_manager.get_page(session_id)
-        ig = InstagramClient(page)
-        insights = await ig.get_insights()
-        
-        return insights
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Insights error")
-        raise HTTPException(500, str(e))
-
-@app.post("/auth/logout")
-async def logout(session_id: str):
-    """Logout and close session."""
-    await session_manager.close_session(session_id)
-    return {"success": True}
-
 @app.get("/sessions")
 async def list_sessions():
-    """List active sessions."""
     return {
         "sessions": [
             {
                 "session_id": sid,
-                "logged_in": s.get("logged_in"),
-                "username": s.get("username"),
+                "ig": s.get("ig"),
+                "li": s.get("li"),
                 "created_at": s["created_at"].isoformat(),
             }
             for sid, s in session_manager.sessions.items()
         ]
     }
 
+
+# ============================================================
+# Instagram Endpoints
+# ============================================================
+
+@app.post("/auth/login", response_model=SessionResponse)
+async def ig_login(
+    username: str = Form(...),
+    password: str = Form(...),
+    session_id: Optional[str] = Form(None),
+):
+    """Login to Instagram with username/password."""
+    try:
+        if session_id:
+            session = await session_manager.get_session(session_id)
+        else:
+            session_id = await session_manager.create_session()
+            session = session_manager.sessions[session_id]
+
+        page = await session_manager.get_page(session_id)
+        await apply_stealth(page)
+        ig = InstagramClient(page)
+        result = await ig.login(username, password)
+
+        if result.get("challenge"):
+            session["ig"]["challenge_data"] = result
+            return SessionResponse(session_id=session_id, challenge=result, logged_in=False)
+
+        if result.get("success"):
+            session["ig"]["logged_in"] = True
+            session["ig"]["username"] = result.get("username")
+            return SessionResponse(
+                session_id=session_id, logged_in=True,
+                username=result.get("username"),
+                sessionid=result.get("sessionid"),
+            )
+
+        return SessionResponse(
+            session_id=session_id, logged_in=False,
+            error=result.get("error", "Login failed"))
+    except Exception as e:
+        logger.exception("IG login error")
+        raise HTTPException(500, str(e))
+
+
+@app.post("/auth/sessionid", response_model=SessionResponse)
+async def ig_sessionid(
+    sessionid: str = Form(...),
+    session_id: Optional[str] = Form(None),
+):
+    """Login to Instagram by injecting sessionid cookie (no password)."""
+    try:
+        if session_id:
+            session = await session_manager.get_session(session_id)
+        else:
+            session_id = await session_manager.create_session()
+            session = session_manager.sessions[session_id]
+
+        page = await session_manager.get_page(session_id)
+        await apply_stealth(page)
+        ig = InstagramClient(page)
+        result = await ig.login_by_sessionid(sessionid)
+
+        if result.get("success"):
+            session["ig"]["logged_in"] = True
+            return SessionResponse(
+                session_id=session_id, logged_in=True,
+                sessionid=sessionid)
+        return SessionResponse(
+            session_id=session_id, logged_in=False,
+            error=result.get("error", "Invalid sessionid"))
+    except Exception as e:
+        logger.exception("IG sessionid error")
+        raise HTTPException(500, str(e))
+
+
+@app.post("/auth/challenge/resolve", response_model=SessionResponse)
+async def ig_challenge_resolve(
+    session_id: str = Form(...),
+    security_code: str = Form(...),
+):
+    """Resolve Instagram challenge with security code."""
+    try:
+        session = await session_manager.get_session(session_id)
+        page = await session_manager.get_page(session_id)
+        ig = InstagramClient(page)
+        result = await ig.resolve_challenge(security_code)
+
+        if result.get("success") and result.get("logged_in"):
+            session["ig"]["logged_in"] = True
+            session["ig"]["challenge_data"] = None
+            return SessionResponse(session_id=session_id, logged_in=True,
+                                   username=session["ig"].get("username"))
+        return SessionResponse(session_id=session_id, logged_in=False,
+                               error=result.get("error", "Challenge failed"))
+    except Exception as e:
+        logger.exception("IG challenge error")
+        raise HTTPException(500, str(e))
+
+
+@app.get("/auth/settings")
+async def ig_auth_settings(session_id: str):
+    """Check Instagram login status."""
+    try:
+        session = await session_manager.get_session(session_id)
+        page = await session_manager.get_page(session_id)
+        ig = InstagramClient(page)
+        profile = await ig.get_profile_info()
+        return {
+            "logged_in": profile["logged_in"],
+            "username": profile.get("username") or session["ig"].get("username"),
+            "session_id": session_id,
+            "platform": "instagram",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/photo/upload")
+async def ig_photo_upload(
+    session_id: str = Form(...),
+    caption: str = Form(""),
+    image_url: str = Form(...),
+):
+    """Upload a photo to Instagram."""
+    try:
+        session = await session_manager.get_session(session_id)
+        if not session["ig"].get("logged_in"):
+            raise HTTPException(401, "Not logged in to Instagram")
+        page = await session_manager.get_page(session_id)
+        ig = InstagramClient(page)
+        tmp = await download_image(image_url)
+        try:
+            return await ig.upload_photo(tmp, caption)
+        finally:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("IG photo upload error")
+        raise HTTPException(500, str(e))
+
+
+@app.get("/user/posts")
+async def ig_user_posts(
+    session_id: str,
+    username: Optional[str] = None,
+    amount: int = 12,
+):
+    """Get recent Instagram posts."""
+    try:
+        session = await session_manager.get_session(session_id)
+        if not session["ig"].get("logged_in"):
+            raise HTTPException(401, "Not logged in to Instagram")
+        page = await session_manager.get_page(session_id)
+        ig = InstagramClient(page)
+        target = username or session["ig"].get("username")
+        if not target:
+            raise HTTPException(400, "Username required")
+        media = await ig.get_media(target, amount)
+        return {"items": media}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/account/info")
+async def ig_account_info(session_id: str):
+    """Get Instagram account info."""
+    try:
+        session = await session_manager.get_session(session_id)
+        if not session["ig"].get("logged_in"):
+            raise HTTPException(401, "Not logged in to Instagram")
+        page = await session_manager.get_page(session_id)
+        ig = InstagramClient(page)
+        profile = await ig.get_profile_info()
+        return {
+            "username": profile.get("username") or session["ig"].get("username"),
+            "logged_in": True,
+            "platform": "instagram",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/auth/logout")
+async def ig_logout(session_id: str):
+    """Close a session."""
+    await session_manager.close_session(session_id)
+    return {"success": True}
+
+
+# ============================================================
+# LinkedIn Endpoints
+# ============================================================
+
+@app.post("/linkedin/auth/login", response_model=SessionResponse)
+async def li_login(
+    email: str = Form(...),
+    password: str = Form(...),
+    session_id: Optional[str] = Form(None),
+):
+    """Login to LinkedIn with email/password."""
+    try:
+        if session_id:
+            session = await session_manager.get_session(session_id)
+        else:
+            session_id = await session_manager.create_session()
+            session = session_manager.sessions[session_id]
+
+        page = await session_manager.get_page(session_id)
+        await apply_stealth(page)
+        li = LinkedInClient(page)
+        result = await li.login(email, password)
+
+        if result.get("challenge"):
+            session["li"]["challenge_data"] = result
+            return SessionResponse(
+                session_id=session_id, platform="linkedin",
+                challenge=result, logged_in=False)
+
+        if result.get("success"):
+            session["li"]["logged_in"] = True
+            return SessionResponse(
+                session_id=session_id, platform="linkedin",
+                logged_in=True, li_at=result.get("li_at"))
+
+        return SessionResponse(
+            session_id=session_id, platform="linkedin",
+            logged_in=False, error=result.get("error", "Login failed"))
+    except Exception as e:
+        logger.exception("LI login error")
+        raise HTTPException(500, str(e))
+
+
+@app.post("/linkedin/auth/sessionid", response_model=SessionResponse)
+async def li_sessionid(
+    li_at: str = Form(...),
+    session_id: Optional[str] = Form(None),
+):
+    """Login to LinkedIn by injecting li_at cookie."""
+    try:
+        if session_id:
+            session = await session_manager.get_session(session_id)
+        else:
+            session_id = await session_manager.create_session()
+            session = session_manager.sessions[session_id]
+
+        page = await session_manager.get_page(session_id)
+        await apply_stealth(page)
+        li = LinkedInClient(page)
+        result = await li.login_by_sessionid(li_at)
+
+        if result.get("success"):
+            session["li"]["logged_in"] = True
+            return SessionResponse(
+                session_id=session_id, platform="linkedin",
+                logged_in=True, li_at=li_at)
+        return SessionResponse(
+            session_id=session_id, platform="linkedin",
+            logged_in=False, error=result.get("error", "Invalid li_at"))
+    except Exception as e:
+        logger.exception("LI sessionid error")
+        raise HTTPException(500, str(e))
+
+
+@app.post("/linkedin/auth/2fa")
+async def li_resolve_2fa(
+    session_id: str = Form(...),
+    pin: str = Form(...),
+):
+    """Resolve LinkedIn 2FA challenge."""
+    try:
+        session = await session_manager.get_session(session_id)
+        page = await session_manager.get_page(session_id)
+        li = LinkedInClient(page)
+        result = await li.resolve_2fa(pin)
+        if result.get("success"):
+            session["li"]["logged_in"] = True
+            return SessionResponse(
+                session_id=session_id, platform="linkedin",
+                logged_in=True, li_at=result.get("li_at"))
+        return SessionResponse(
+            session_id=session_id, platform="linkedin",
+            logged_in=False, error=result.get("error"))
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/linkedin/auth/settings")
+async def li_auth_settings(session_id: str):
+    """Check LinkedIn login status."""
+    try:
+        session = await session_manager.get_session(session_id)
+        page = await session_manager.get_page(session_id)
+        li = LinkedInClient(page)
+        profile = await li.get_profile_info()
+        return {
+            "logged_in": profile["logged_in"],
+            "username": profile.get("username") or session["li"].get("username"),
+            "session_id": session_id,
+            "platform": "linkedin",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/linkedin/post/text")
+async def li_post_text(
+    session_id: str = Form(...),
+    text: str = Form(...),
+):
+    """Post a text update to LinkedIn."""
+    try:
+        session = await session_manager.get_session(session_id)
+        if not session["li"].get("logged_in"):
+            raise HTTPException(401, "Not logged in to LinkedIn")
+        page = await session_manager.get_page(session_id)
+        li = LinkedInClient(page)
+        result = await li.post_text(text)
+        if result.get("success"):
+            return {"success": True}
+        raise HTTPException(500, result.get("error", "Post failed"))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/linkedin/post/image")
+async def li_post_image(
+    session_id: str = Form(...),
+    text: str = Form(""),
+    image_url: str = Form(...),
+):
+    """Post an image to LinkedIn."""
+    try:
+        session = await session_manager.get_session(session_id)
+        if not session["li"].get("logged_in"):
+            raise HTTPException(401, "Not logged in to LinkedIn")
+        page = await session_manager.get_page(session_id)
+        li = LinkedInClient(page)
+        tmp = await download_image(image_url)
+        try:
+            result = await li.post_image(tmp, text)
+            if result.get("success"):
+                return {"success": True}
+            raise HTTPException(500, result.get("error", "Post failed"))
+        finally:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+# ============================================================
+# Main
+# ============================================================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host=settings.HOST, port=settings.PORT)
